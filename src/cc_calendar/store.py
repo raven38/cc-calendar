@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .canonical.claude_code import CanonicalImport, ClaudeCodeAdapter
+from .canonical.codex_local import CodexLocalAdapter
 from .parser import SessionAcc
 from .search import SearchIndex
 
@@ -39,14 +41,37 @@ class ClaudeDir:
         return self.path / "sessions"
 
 
+@dataclass(frozen=True)
+class CodexDir:
+    """A Codex home directory explicitly selected for local read-only import."""
+
+    name: str
+    path: Path
+
+    @property
+    def sessions_dir(self) -> Path:
+        return self.path / "sessions"
+
+    @property
+    def archived_sessions_dir(self) -> Path:
+        return self.path / "archived_sessions"
+
+
 class Store:
-    def __init__(self, dirs: Path | list[ClaudeDir], index: SearchIndex | None = None):
+    def __init__(
+        self,
+        dirs: Path | list[ClaudeDir],
+        index: SearchIndex | None = None,
+        codex_dirs: list[CodexDir] | None = None,
+    ):
         self.dirs = [ClaudeDir("local", dirs)] if isinstance(dirs, Path) else list(dirs)
+        self.codex_dirs = list(codex_dirs or [])
         self.index = index  # full-text index, told about every transcript that changes
         # The same session can be in several directories (e.g. synced copies): every copy
         # is indexed, and `sessions` holds the one with the newest activity.
         self.copies: dict[str, dict[str, SessionAcc]] = {}  # sid -> dir name -> session
         self.sessions: dict[str, SessionAcc] = {}
+        self.codex_sessions: dict[str, CanonicalImport] = {}
         self.files: dict[Path, FileState] = {}
         self.lock = threading.RLock()
 
@@ -65,10 +90,40 @@ class Store:
                     self.update_file(path)
                 for path in sorted(projects.glob("*/*/subagents/*.jsonl")):
                     self.update_file(path)
+            self._scan_codex()
             if self.index is not None:
                 # Forget transcripts Claude Code has deleted since the last run.
                 keep = {str(p) for p in self.files}
                 self.index.prune([d.projects_dir for d in self.dirs], keep)
+
+    def _scan_codex(self) -> None:
+        """Read explicitly selected Codex rollout files without enabling any network source."""
+        for source in self.codex_dirs:
+            adapter = CodexLocalAdapter(source_instance=source.name)
+            roots = (source.sessions_dir, source.archived_sessions_dir)
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                for path in sorted(root.rglob("*.jsonl")):
+                    try:
+                        imported = adapter.import_jsonl(path)
+                    except (OSError, ValueError) as exc:
+                        log.warning("could not read Codex rollout %s: %s", path, exc)
+                        continue
+                    if imported is None:
+                        continue
+                    current = self.codex_sessions.get(imported.session.id)
+                    if current is None or (imported.session.end or -1) >= (
+                        current.session.end or -1
+                    ):
+                        self.codex_sessions[imported.session.id] = imported
+
+    def source_catalog(self) -> list[dict[str, str]]:
+        """Return the local sources selected for this store, for UI selectors."""
+        return [
+            *({"name": d.name, "path": str(d.path), "kind": "claude-code"} for d in self.dirs),
+            *({"name": d.name, "path": str(d.path), "kind": "codex"} for d in self.codex_dirs),
+        ]
 
     def classify(self, path: Path) -> tuple[ClaudeDir, str, str, str | None] | None:
         """-> (dir, kind, session_id, agent_id) for a path under a projects/, or None."""
@@ -167,6 +222,28 @@ class Store:
                 for d in self.dirs
                 if d.name in self.copies.get(sid, {}) and (shown is None or d.name != shown.source)
             ]
+
+    def canonical_import(self, sid: str, live: dict | None = None) -> CanonicalImport | None:
+        """Return a read-only canonical projection of a stored Claude session.
+
+        The existing ``SessionAcc`` remains the live analytics source. Events are
+        projected from the selected transcript copy only when this method is
+        requested, so canonicalization cannot mutate or replace the existing index.
+        """
+        with self.lock:
+            session = self.sessions.get(sid)
+            if session is None:
+                return None
+            adapter = ClaudeCodeAdapter(source_instance=f"claude-code-{session.source or 'local'}")
+            try:
+                imported = adapter.import_jsonl(Path(session.path), live=live)
+            except OSError:
+                imported = adapter.from_acc(session, live=live)
+            else:
+                # Preserve the selected, incrementally parsed accumulator for
+                # existing analytics and only use the fresh read for events.
+                imported = adapter.from_acc(session, imported.events, live=live)
+            return imported
 
     @staticmethod
     def _read_new(path: Path, state: FileState):

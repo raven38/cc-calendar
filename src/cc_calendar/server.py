@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import sqlite3
+from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -23,7 +25,7 @@ from .notes import NOTE_LIMIT, TAGS_PER_SESSION, Notes, NotesUnavailable
 from .parser import SessionAcc
 from .search import MIN_QUERY, SearchIndex, snippet
 from .stats import log_stats
-from .store import ClaudeDir, Store
+from .store import ClaudeDir, CodexDir, Store
 from .tools import tool_usage
 
 log = logging.getLogger(__name__)
@@ -106,6 +108,149 @@ def summary(
         "search": search,
         **notes.get(s.session_id),  # note, tags
     }
+
+
+def canonical_summary(imported, gap_ms: int, notes: Notes) -> dict:
+    """Adapt a canonical source to the existing list/calendar response shape."""
+    session = imported.session
+    events = imported.events
+    times = sorted(event.ts for event in events if event.ts is not None)
+    segments: list[list[int]] = []
+    if times:
+        segments = [[times[0], times[0]]]
+        for timestamp in times[1:]:
+            if timestamp - segments[-1][1] > gap_ms:
+                segments.append([timestamp, timestamp])
+            else:
+                segments[-1][1] = timestamp
+    source = imported.source
+    tokens = source.tokens() if hasattr(source, "tokens") else None
+    model = getattr(source, "model", None)
+    effort = getattr(source, "effort", None)
+    prompts = [event for event in events if event.kind == "user_message"]
+    search = " ".join([session.title or "", *(event.text or "" for event in events if event.text)])[
+        :SEARCH_TEXT_LIMIT
+    ]
+    return {
+        "id": session.id,
+        "title": session.title,
+        "project": session.cwd or session.project_id,
+        "project_name": imported.project.name if imported.project else session.project_id,
+        "source": session.source_instance,
+        "branch": session.branch,
+        "status": session.status,
+        "start": session.start,
+        "end": session.end,
+        "segments": segments,
+        "density": dict(
+            Counter(event.ts // (10 * 60 * 1000) for event in events if event.ts is not None)
+        ),
+        "cost_density": {},
+        "marks": [],
+        "prompt_count": len(prompts),
+        "tokens": tokens,
+        "cost": None,
+        "cost_estimated": False,
+        "cache_hit": None,
+        "cache_saved": None,
+        "model": model,
+        "effort": effort,
+        "version": None,
+        "commit_list": [],
+        "repo_url": None,
+        "continued_in": None,
+        "continued_from": None,
+        "search": search,
+        **notes.get(session.id),
+    }
+
+
+def canonical_detail(imported, gap_ms: int, notes: Notes) -> dict:
+    out = canonical_summary(imported, gap_ms, notes)
+    session = imported.session
+    source = imported.source
+    out.update(
+        {
+            "cwd": session.cwd,
+            "models": [source.model] if getattr(source, "model", None) else [],
+            "efforts": {source.effort: 1} if getattr(source, "effort", None) else {},
+            "compactions": [],
+            "permission_mode": None,
+            "context_pct": None,
+            "checks": {
+                "turn_ended": None,
+                "no_background": None,
+                "clean_exit": None,
+                "committed": None,
+            },
+            "prompts": [
+                {
+                    "uuid": event.id,
+                    "ts": event.ts,
+                    "text": event.text or "",
+                    "kind": "prompt",
+                    "commits": [],
+                }
+                for event in imported.events
+                if event.kind == "user_message"
+            ],
+            "commits": [],
+            "files": [],
+            "prs": [],
+            "subagents": [],
+            "background": [],
+            "cost_state": None,
+            "canonical_events": [asdict(event) for event in imported.events],
+            "canonical_project": asdict(imported.project) if imported.project else None,
+        }
+    )
+    return out
+
+
+def canonical_log_entry(event, index: int) -> dict:
+    """Adapt canonical events to the transcript viewer's existing entry contract."""
+    kind = {
+        "user_message": "user",
+        "assistant_message": "assistant",
+        "tool_call": "tool_use",
+        "tool_result": "tool_result",
+        "api_error": "error",
+        "status": "meta",
+    }.get(event.kind, event.kind)
+    entry = {
+        "i": index,
+        "ts": event.ts,
+        "kind": kind,
+        "text": event.text or event.tool_output or "",
+        "role": event.role,
+        "model": event.model,
+    }
+    if event.kind == "tool_call":
+        entry.update(
+            {
+                "id": event.tool_call_id or f"canonical-tool-{index}",
+                "name": event.tool_name or "unknown",
+                "input": _canonical_log_value(event.tool_input),
+            }
+        )
+    elif event.kind == "tool_result":
+        entry["tool_use_id"] = event.tool_call_id
+        entry["is_error"] = event.is_error
+    elif event.kind in ("status", "api_error", "interrupt"):
+        metadata = event.metadata or {}
+        entry["text"] = metadata.get("provider_type") or metadata.get("status") or entry["text"]
+    return entry
+
+
+def _canonical_log_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def detail(
@@ -203,10 +348,11 @@ def create_app(
     watch: bool = True,
     notes_path: Path | None = None,
     index_path: Path | None = None,
+    codex_dirs: list[CodexDir] | None = None,
 ) -> FastAPI:
     """`notes_path=None` and `index_path=None` keep notes and the search index in memory only
     (used by tests)."""
-    store = Store(dirs, open_index(index_path))
+    store = Store(dirs, open_index(index_path), codex_dirs=codex_dirs)
     notes = Notes(notes_path)
     broadcaster = Broadcaster()
     sessions_dirs = {d.sessions_dir for d in store.dirs}
@@ -271,9 +417,15 @@ def create_app(
                 for s in store.sessions.values()
                 if s.start is not None
             ]
+            items.extend(
+                canonical_summary(imported, gap * 60_000, notes)
+                for imported in store.codex_sessions.values()
+                if imported.session.start is not None
+            )
         return {
             "sessions": items,
             "claude_dirs": [{"name": d.name, "path": str(d.path)} for d in store.dirs],
+            "sources": store.source_catalog(),
             "version": __version__,
             "tags": notes.all_tags(),
             "notes_error": notes.error,
@@ -319,10 +471,24 @@ def create_app(
         live = store.live_sessions()
         notes.refresh()
         with store.lock:
+            if sid in store.codex_sessions:
+                return canonical_detail(store.codex_sessions[sid], gap * 60_000, notes)
             s = get_session(sid)
             out = detail(s, live.get(sid), gap * 60_000, store.continued_from().get(sid), notes)
         out["also_in"] = store.also_in(sid)
         return out
+
+    @app.get("/api/sessions/{sid}/canonical")
+    def canonical_session(sid: str) -> dict:
+        imported = store.canonical_import(sid, store.live_sessions().get(sid))
+        if imported is None:
+            raise HTTPException(404, "session not found")
+        return {
+            "session": asdict(imported.session),
+            "events": [asdict(event) for event in imported.events],
+            "assignment": asdict(imported.assignment),
+            "project": asdict(imported.project) if imported.project is not None else None,
+        }
 
     @app.put("/api/sessions/{sid}/notes", dependencies=[Depends(same_origin_json)])
     async def update_notes(sid: str, body: NotesUpdate) -> dict:
@@ -364,6 +530,15 @@ def create_app(
         limit: int = Query(300, ge=1, le=2000),
         q: str | None = Query(None, max_length=QUERY_LIMIT),
     ) -> dict:
+        if sid in store.codex_sessions:
+            imported = store.codex_sessions[sid]
+            entries = [canonical_log_entry(event, i) for i, event in enumerate(imported.events)]
+            return {
+                "total": len(entries),
+                "offset": offset,
+                "entries": entries[offset : offset + limit],
+                **({"events": []} if offset == 0 else {}),
+            }
         path, filter_sid = log_path(sid, agent)
         try:
             entries = build_entries(path, filter_sid)

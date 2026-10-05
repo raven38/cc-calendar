@@ -5,7 +5,7 @@ import shutil
 from conftest import PROJECT, LogBuilder
 
 from cc_calendar import store as store_mod
-from cc_calendar.store import ClaudeDir, Store
+from cc_calendar.store import ClaudeDir, CodexDir, Store
 
 
 def test_scan(claude_dir):
@@ -27,6 +27,85 @@ def test_scan(claude_dir):
     assert [p["text"] for p in nxt.prompts] == ["Carry on"]
     assert nxt.state(None)[0] == "done"
     assert store.sessions["s-prev"].state(None)[0] == "interrupted"
+
+
+def test_canonical_import_projects_existing_session_without_replacing_analytics(claude_dir):
+    store = Store(claude_dir)
+    store.scan()
+
+    imported = store.canonical_import("s-basic")
+
+    assert imported is not None
+    assert imported.session.product == "claude-code"
+    assert imported.session.source_instance == "claude-code-local"
+    assert imported.session.project_id == "__misc__"
+    assert imported.source.tokens() == store.sessions["s-basic"].tokens()
+    assert imported.events
+    assert all(event.session_id == imported.session.id for event in imported.events)
+
+
+def test_codex_source_scan_is_opt_in_and_exposes_source_catalog(claude_dir, tmp_path):
+    codex_root = tmp_path / "codex"
+    rollout = codex_root / "sessions" / "2026" / "10" / "05" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-synthetic",
+                    "timestamp": "2026-10-05T01:00:00+00:00",
+                    "cwd": "/work/demo",
+                },
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": "2026-10-05T01:00:01+00:00",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "synthetic Codex"}],
+                },
+            }
+        )
+        + "\n"
+    )
+    store = Store(claude_dir, codex_dirs=[CodexDir("codex-main", codex_root)])
+    store.scan()
+
+    assert len(store.codex_sessions) == 1
+    imported = next(iter(store.codex_sessions.values()))
+    assert imported.session.source_instance == "codex-main"
+    assert imported.session.project_id == "__misc__"
+    assert {source["name"] for source in store.source_catalog()} == {"local", "codex-main"}
+
+
+def test_codex_partial_jsonl_and_repeated_scan_are_safe(claude_dir, tmp_path):
+    codex_root = tmp_path / "codex"
+    rollout = codex_root / "sessions" / "partial.jsonl"
+    rollout.parent.mkdir(parents=True)
+    complete = json.dumps(
+        {
+            "type": "session_meta",
+            "payload": {"id": "partial", "cwd": "/work/partial"},
+        }
+    )
+    rollout.write_text(complete[:20])
+    store = Store(claude_dir, codex_dirs=[CodexDir("codex-main", codex_root)])
+    store.scan()
+    assert store.codex_sessions == {}
+
+    rollout.write_text(complete + "\n")
+    store.scan()
+    assert len(store.codex_sessions) == 1
+    imported = next(iter(store.codex_sessions.values()))
+    first_event_count = len(imported.events)
+    store.scan()
+    assert len(store.codex_sessions) == 1
+    assert len(next(iter(store.codex_sessions.values())).events) == first_event_count
 
 
 def test_incremental_reads(claude_dir):

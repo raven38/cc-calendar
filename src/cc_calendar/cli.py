@@ -15,7 +15,7 @@ import uvicorn
 
 from . import __version__, notes, search
 from .server import create_app
-from .store import ClaudeDir
+from .store import ClaudeDir, CodexDir
 
 HOST = "127.0.0.1"
 NAME_RE = re.compile(r"[\w.-]+")
@@ -69,6 +69,31 @@ def claude_dirs(specs: list[str]) -> list[ClaudeDir]:
     return out
 
 
+def codex_dirs(specs: list[str]) -> list[CodexDir]:
+    """Parse explicitly selected Codex home directories; never auto-read Codex history."""
+    home_codex = (Path.home() / ".codex").resolve()
+    out: list[CodexDir] = []
+    for spec in specs:
+        name, sep, rest = spec.partition("=")
+        if not (sep and NAME_RE.fullmatch(name)):
+            name, rest = "", spec
+        path = Path(rest).expanduser().resolve()
+        if not path.is_dir():
+            print(f"cc-calendar: warning: skipping {rest}: not a directory", file=sys.stderr)
+            continue
+        if any(source.path == path for source in out):
+            print(f"cc-calendar: warning: skipping {rest}: given twice", file=sys.stderr)
+            continue
+        if not name:
+            name = "codex-local" if path == home_codex else path.name or "codex"
+        taken = {source.name for source in out}
+        unique, n = name, 2
+        while unique in taken:
+            unique, n = f"{name}-{n}", n + 1
+        out.append(CodexDir(unique, path))
+    return out
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="cc-calendar", description="Weekly calendar view of your Claude Code sessions."
@@ -81,6 +106,13 @@ def main(argv: list[str] | None = None) -> None:
         metavar="[NAME=]PATH",
         help="Claude Code config directory to read; repeat to show several together "
         "(default: ~/.claude)",
+    )
+    parser.add_argument(
+        "--codex-dir",
+        action="append",
+        metavar="[NAME=]PATH",
+        help="Codex home directory to read locally; repeat to show several together "
+        "(opt-in; no Codex history is read by default)",
     )
     parser.add_argument(
         "--notes",
@@ -101,10 +133,16 @@ def main(argv: list[str] | None = None) -> None:
     port = args.port or free_port()
     url = f"http://{HOST}:{port}/"
     dirs = claude_dirs(args.claude_dir or [str(Path.home() / ".claude")])
+    codex = codex_dirs(args.codex_dir or [])
     notes_path = (args.notes or notes.default_path()).expanduser()
     index_path = (args.search_index or search.default_path()).expanduser()
-    app = create_app(dirs, notes_path=notes_path, index_path=index_path)
-    reading = ", ".join(f"{d.name} ({d.path})" for d in dirs) or "nothing"
+    app = create_app(dirs, notes_path=notes_path, index_path=index_path, codex_dirs=codex)
+    reading = (
+        ", ".join(
+            [*(f"{d.name} ({d.path})" for d in dirs), *(f"{d.name} ({d.path})" for d in codex)]
+        )
+        or "nothing"
+    )
     print(f"cc-calendar {__version__}: reading {reading} — serving {url}")
     if error := app.state.notes.error:
         print(f"cc-calendar: warning: notes cannot be saved: {error}", file=sys.stderr)

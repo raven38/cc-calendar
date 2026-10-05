@@ -48,7 +48,7 @@ export const state = {
   project: null, // path of the project whose page is open, or null
   projectColors: new Map(),
   modelColors: new Map(),
-  claudeDirs: [], // [{name, path}] of the config directories being read
+  claudeDirs: [], // [{name, path, kind}] of the local sources being read
   sourceColors: new Map(),
   tagColors: new Map(),
   tags: [], // [{tag, count}] of every tag in use, most used first
@@ -87,7 +87,7 @@ async function loadSessions() {
   const data = await fetchJSON(`/api/sessions?gap=${state.gap}`);
   state.sessions = data.sessions;
   state.appVersion = data.version;
-  state.claudeDirs = data.claude_dirs || [];
+  state.claudeDirs = data.sources || data.claude_dirs || [];
   state.tags = data.tags || [];
   state.notesError = data.notes_error || null;
   state.byId = new Map(data.sessions.map((s) => [s.id, s]));

@@ -1,9 +1,11 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from cc_calendar import __version__
 from cc_calendar.server import create_app
-from cc_calendar.store import ClaudeDir
+from cc_calendar.store import ClaudeDir, CodexDir
 
 
 @pytest.fixture
@@ -67,6 +69,95 @@ def test_session_detail(client):
     assert [a["id"] for a in sub["subagents"]] == ["a1"]
     assert sub["subagents"][0]["has_log"] is True
     assert client.get("/api/sessions/nope").status_code == 404
+
+
+def test_canonical_projection(client):
+    data = client.get("/api/sessions/s-basic/canonical").json()
+    assert data["session"]["product"] == "claude-code"
+    assert data["session"]["source_instance"] == "claude-code-local"
+    assert data["session"]["project_id"] == "__misc__"
+    assert data["assignment"]["provenance"] == "misc"
+    assert data["project"]["visibility"] == "private"
+    assert data["project"]["export_policy"] == "local_only"
+    assert data["project"]["analysis_policy"] == "local"
+    assert data["events"]
+    assert all(event["session_id"] == data["session"]["id"] for event in data["events"])
+
+
+@pytest.fixture
+def codex_client(claude_dir, tmp_path):
+    codex_root = tmp_path / "codex"
+    rollout = codex_root / "sessions" / "2026" / "10" / "05" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "codex-api-session",
+                "timestamp": "2026-10-05T01:00:00+00:00",
+                "cwd": "/work/codex",
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-10-05T01:00:01+00:00",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "synthetic"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "id": "codex-api-assistant",
+            "timestamp": "2026-10-05T01:00:02+00:00",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "synthetic reply"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "id": "codex-api-duplicate",
+            "timestamp": "2026-10-05T01:00:02+00:00",
+            "payload": {
+                "type": "agent_message",
+                "message_id": "codex-api-assistant",
+                "role": "assistant",
+                "text": "synthetic reply",
+            },
+        },
+    ]
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with TestClient(
+        create_app(
+            claude_dir,
+            watch=False,
+            codex_dirs=[CodexDir("codex-main", codex_root)],
+        ),
+        base_url="http://127.0.0.1",
+    ) as c:
+        yield c
+
+
+def test_codex_is_in_source_selector_and_session_list(codex_client):
+    data = codex_client.get("/api/sessions").json()
+    assert {source["name"] for source in data["sources"]} == {"local", "codex-main"}
+    codex = [session for session in data["sessions"] if session["source"] == "codex-main"]
+    assert len(codex) == 1
+    assert codex[0]["project"] == "/work/codex"
+
+
+def test_codex_log_uses_existing_transcript_shapes_and_deduplicates(codex_client):
+    data = codex_client.get("/api/sessions").json()
+    codex_id = next(
+        session["id"] for session in data["sessions"] if session["source"] == "codex-main"
+    )
+    log = codex_client.get(f"/api/sessions/{codex_id}/log").json()
+
+    assert [entry["kind"] for entry in log["entries"]] == ["user", "assistant"]
+    assert [entry["text"] for entry in log["entries"]] == ["synthetic", "synthetic reply"]
 
 
 def test_log(client):

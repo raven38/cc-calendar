@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from cc_calendar.cli import claude_dirs
+from cc_calendar.cli import claude_dirs, codex_dirs
 
 
 def test_default_dir_is_named_local(tmp_path, monkeypatch):
@@ -45,3 +45,13 @@ def test_skips_missing_and_repeated(tmp_path, capsys):
 
 def test_nothing_left(tmp_path):
     assert claude_dirs([str(Path(tmp_path) / "missing")]) == []
+
+
+def test_codex_dirs_are_opt_in_and_named(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert [(d.name, d.path) for d in codex_dirs(["~/.codex"])] == [
+        ("codex-local", codex.resolve())
+    ]

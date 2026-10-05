@@ -5,6 +5,7 @@ export const STATUS_LABELS = {
   waiting: "Waiting",
   done: "Done",
   interrupted: "Interrupted",
+  unknown: "Unknown",
 };
 
 // Smallest calendar zoom, in pixels per hour.
@@ -15,6 +16,7 @@ export const STATUS_HINTS = {
   waiting: "Claude Code is open and waiting for your input",
   done: "The last turn finished and nothing was left running",
   interrupted: "The session ended mid-turn, was stopped with Esc, or left background work unfinished",
+  unknown: "The source did not provide enough status information",
 };
 
 export function statusColor(status) {
@@ -49,6 +51,7 @@ export function h(tag, attrs = {}, ...children) {
 }
 
 export function fmtTokens(n) {
+  if (n == null) return "–";
   if (!n) return "0";
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
