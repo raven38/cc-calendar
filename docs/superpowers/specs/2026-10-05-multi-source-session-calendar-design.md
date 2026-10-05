@@ -277,6 +277,12 @@ src/cc_calendar/
         claude_export.py
         chatgpt_export.py
 
+    collector_sinks/
+        base.py
+        drive.py
+        github.py
+        local.py
+
     sync/
         manager.py
         cursor.py
@@ -341,49 +347,129 @@ Both products can use their own scheduled/background chat capabilities to inspec
 
 The scheduled collectors are the primary incremental activity source. Official exports are fallback/backfill sources.
 
-### 9.2 Default storage: Google Drive
+### 9.2 Primary sink: one shared central Google Drive folder
 
-The default collector destination is **Google Drive**.
+The first-choice deployment is a **single shared central sink** owned by the personal Google account.
+
+1. Create `AI Session History` in the personal Google Drive.
+2. Share that folder with the work Google account with **Editor** permission.
+3. Personal and work Claude Chat / ChatGPT collectors write into the same logical sink.
+4. cc-calendar ingests the shared folder **read-only** and never changes collector files or Drive sharing.
+
+The sink remains private by default. The work account is an explicitly granted collaborator; the folder must not be made public or link-accessible merely because a canonical project is public.
 
 Recommended logical layout:
 
 ```text
 AI Session History/
-├── claude-chat/
-│   ├── personal/
-│   │   └── 2026/10/05.jsonl
-│   └── work/
-│
-└── chatgpt/
-    ├── main/
-    │   └── 2026/10/05.jsonl
-    └── sub/
+├── claude-personal/
+│   └── 2026/10/05.jsonl
+├── claude-work/
+│   └── 2026/10/05.jsonl
+├── chatgpt-personal/
+│   └── 2026/10/05.jsonl
+└── chatgpt-work/
+    └── 2026/10/05.jsonl
 ```
+
+A physical subfolder per source is preferred for operational clarity, but the canonical identity is `source_instance`. At minimum the following source instances must remain distinguishable:
+
+- `claude-personal`
+- `claude-work`
+- `chatgpt-personal`
+- `chatgpt-work`
 
 Collectors should write daily or monthly shards rather than one unbounded append-only file.
 
-### 9.3 cc-calendar ingestion path
+### 9.3 Collector sink abstraction
+
+Collectors must not depend directly on Google Drive semantics. They write through a sink interface so the storage backend can be replaced later without changing collector logic.
+
+```python
+class CollectorSink(Protocol):
+    def put_shard(
+        self,
+        source_instance: str,
+        shard_key: str,
+        records: Iterable[dict],
+    ) -> None:
+        ...
+
+    def list_shards(
+        self,
+        source_instance: str,
+        cursor: str | None = None,
+    ) -> Iterable[SinkObject]:
+        ...
+```
+
+Planned sink implementations:
+
+- `DriveSink` — first-choice central sink
+- `LocalSink` — local filesystem / sync-folder testing and offline use
+- `GitHubSink` — future optional backend
+
+The sink abstraction covers collector persistence only. Canonical Session/Event normalization remains downstream in cc-calendar.
+
+### 9.4 cc-calendar ingestion path
 
 Preferred path:
 
 ```text
-Claude/ChatGPT scheduled collector
-            │
-            ▼
-       Google Drive
-            │
-            ▼
- local Drive-synced directory
-            │
-            ▼
-       cc-calendar
+claude-personal ─┐
+claude-work ─────┤
+chatgpt-personal ├─→ CollectorSink (Drive)
+chatgpt-work ────┘          │
+                            ▼
+              AI Session History
+              (personal Drive owner,
+               work account = editor)
+                            │
+                            ▼
+              read-only cc-calendar ingest
 ```
 
-This keeps the cc-calendar process local-first and avoids requiring a Google Drive API dependency for ordinary use.
+For ordinary desktop use, cc-calendar should prefer a locally synced representation of the shared Drive folder so the application stays local-first and does not require Drive API access on every read.
 
-A direct Google Drive API adapter may be added later as an optional source, but it is not required for the first implementation.
+A direct read-only Google Drive source may be added later as an optional ingestion path.
 
-### 9.4 Collector record schema
+### 9.5 Workspace sharing fallback
+
+The single central sink is the preferred topology.
+
+Use separate personal/work Drive sinks **only when the work Google Workspace policy prevents external sharing with the personal Google account**.
+
+Fallback:
+
+```text
+Personal collectors ─→ Personal Drive / AI Session History
+Work collectors ─────→ Work Drive / AI Session History
+                              │
+                              ▼
+                    cc-calendar merges both
+                    as separate source instances
+```
+
+The fallback must not change canonical session IDs, project logic, or source-instance semantics.
+
+### 9.6 Attachment policy
+
+Collectors do **not** persist attachment bodies by default.
+
+Images, ZIP archives, documents, and other attachment payloads are represented only by metadata when available:
+
+```json
+{
+  "attachment_id": "att_...",
+  "filename": "example.zip",
+  "mime_type": "application/zip",
+  "size_bytes": 123456
+}
+```
+
+The exact metadata may vary by provider, but attachment binary content is excluded from the central sink unless a future explicit opt-in policy is designed.
+
+### 9.7 Collector record schema
 
 ```json
 {
@@ -416,7 +502,7 @@ A direct Google Drive API adapter may be added later as an optional source, but 
 
 If native project information is unavailable, `project` is `null`. The collector must not invent native project IDs.
 
-### 9.5 Export backfill
+### 9.8 Export backfill
 
 Claude and ChatGPT official exports are used for:
 
@@ -609,9 +695,16 @@ Visibility, export policy, and analysis policy are three separate axes.
 
 Collector files stored in Google Drive are private by default.
 
-A provider-native project being public must not automatically change Google Drive sharing permissions.
+In the preferred central-sink topology, the personal Google account owns `AI Session History` and the work Google account receives explicit Editor access. This collaborator permission is an ingestion topology choice, not a project-visibility signal.
 
-Provider visibility is recorded as metadata only.
+A provider-native or canonical project being public must not automatically change Google Drive sharing permissions. Drive sharing remains independent from:
+
+- canonical project visibility
+- session visibility
+- export policy
+- analysis policy
+
+Provider visibility is recorded as metadata only. cc-calendar has read-only semantics for the collector sink and must not change Drive ACLs.
 
 ## 16. Project persistence
 
@@ -834,7 +927,15 @@ Add incremental Codex local adapter.
 
 ### Phase 4 — Chat activity ingestion
 
-Add shared `chat_activity.py` adapter for Claude Chat and ChatGPT scheduled-collector JSONL written to locally synced Google Drive folders.
+Add:
+
+- shared `chat_activity.py` adapter for Claude Chat and ChatGPT collector JSONL
+- `CollectorSink` abstraction
+- `DriveSink` as the first-choice sink
+- `LocalSink` for local/offline development and testing
+- source instances for `claude-personal`, `claude-work`, `chatgpt-personal`, and `chatgpt-work`
+- read-only ingestion of the shared central sink
+- separate personal/work Drive fallback only when Workspace external-sharing policy requires it
 
 ### Phase 5 — Export backfill
 
@@ -886,6 +987,11 @@ tests/fixtures/
 
 Required cases include:
 
+- shared central sink with four source instances
+- Workspace external-sharing fallback with separate personal/work sinks
+- read-only sink ingestion
+- attachment metadata without attachment bodies
+- sink backend substitution without changing canonical events
 - malformed/truncated JSONL
 - file append
 - file truncate/rewrite
@@ -927,6 +1033,12 @@ Required mechanisms:
 - [ ] Codex local sessions appear in the same calendar
 - [ ] Claude Chat scheduled activity appears in calendar/search
 - [ ] ChatGPT scheduled activity appears in calendar/search
+- [ ] personal/work Claude and ChatGPT collectors can write to one personal-Drive-owned shared central sink
+- [ ] `claude-personal`, `claude-work`, `chatgpt-personal`, and `chatgpt-work` remain distinguishable
+- [ ] cc-calendar treats collector sink data as read-only
+- [ ] attachment bodies are omitted by default while attachment metadata is retained
+- [ ] separate personal/work Drive sinks work as a fallback when Workspace external sharing is prohibited
+- [ ] collector storage can be swapped through the sink abstraction without changing canonical session/event consumers
 - [ ] Claude and ChatGPT export backfills are idempotent
 - [ ] Claude Code web sessions can be represented without breaking local sources
 - [ ] Codex Cloud tasks/status/diff appear with partial-history labeling
@@ -938,7 +1050,8 @@ Required mechanisms:
 - [ ] source failures do not crash the application
 - [ ] full-text search spans all supported sources
 - [ ] credentials are not persisted in plaintext
-- [ ] collector Google Drive data remains private unless the user explicitly changes Drive sharing
+- [ ] collector Google Drive data remains non-public by default; only explicitly configured collaborators such as the work account receive access
+- [ ] project/session visibility never mutates Drive sharing permissions
 
 ## 30. Non-goals for the first implementation
 
