@@ -142,11 +142,17 @@ class Session:
     external_project_ref: ExternalProjectRef | None
 ```
 
-Global session IDs should not reuse provider-native IDs directly:
+Global session IDs should not depend exclusively on provider-native IDs. For collector-backed chat sessions, use the stable `collector_conversation_id`; for sources with guaranteed native IDs, a namespaced native ID may be used.
 
 ```text
-global_session_id = SHA256(source_instance + ":" + native_id)
+identity_key =
+    collector_conversation_id
+    OR namespaced_native_id
+
+global_session_id = SHA256(source_instance + ":" + identity_key)
 ```
+
+This allows a chat session to remain stable when the collector initially lacks a native conversation ID and learns it later.
 
 ### 5.2 History completeness
 
@@ -469,7 +475,59 @@ Images, ZIP archives, documents, and other attachment payloads are represented o
 
 The exact metadata may vary by provider, but attachment binary content is excluded from the central sink unless a future explicit opt-in policy is designed.
 
-### 9.7 Collector record schema
+### 9.7 Collector conversation identity
+
+Provider-native conversation IDs are useful but are not required. Some chat-history surfaces may expose timestamps, titles, or stable references without exposing the native conversation ID.
+
+Therefore:
+
+- `conversation_id` is nullable and means only the provider-native ID.
+- `collector_conversation_id` is required and is the stable identity used by collector ingestion and deduplication.
+- Once assigned, `collector_conversation_id` must not change merely because a better native identifier becomes available later.
+- Native identifiers discovered later are attached as additional identity evidence.
+
+Identity resolution priority:
+
+1. provider-native `conversation_id`
+2. stable ID embedded in the provider conversation URL
+3. stable conversation/thread reference exposed by the history system
+4. deterministic hash of `created_at + first_message_at + normalized_title`, namespaced by provider and `source_instance`
+5. persistent collector UUID mapped from the best available fingerprint
+
+For deterministic derived IDs, use a namespaced canonical input such as:
+
+```text
+sha256(
+  provider + "\n" +
+  source_instance + "\n" +
+  created_at + "\n" +
+  first_message_at + "\n" +
+  normalized_title
+)
+```
+
+Title alone must never be used as a conversation identity because repeated titles are common.
+
+If the collector must use fallback 5, it must persist a `fingerprint -> UUID` mapping in collector state. It must not generate a new UUID on every run.
+
+Example:
+
+```json
+{
+  "conversation_id": null,
+  "collector_conversation_id": "chatgpt-personal:sha256:abc123...",
+  "collector_id_method": "created_at+first_message_at+title",
+  "collector_id_inputs": [
+    "created_at",
+    "first_message_at",
+    "title"
+  ]
+}
+```
+
+A missing native ID must never stop collection.
+
+### 9.8 Collector record schema
 
 ```json
 {
@@ -477,7 +535,9 @@ The exact metadata may vary by provider, but attachment binary content is exclud
   "product": "chatgpt",
   "account": "main",
 
-  "conversation_id": "abc123",
+  "conversation_id": null,
+  "collector_conversation_id": "chatgpt-personal:sha256:abc123...",
+  "collector_id_method": "created_at+first_message_at+title",
   "title": "Quad dominant mesh research",
 
   "project": {
@@ -502,7 +562,7 @@ The exact metadata may vary by provider, but attachment binary content is exclud
 
 If native project information is unavailable, `project` is `null`. The collector must not invent native project IDs.
 
-### 9.8 Export backfill
+### 9.9 Export backfill
 
 Claude and ChatGPT official exports are used for:
 
@@ -1001,6 +1061,12 @@ Required cases include:
 - duplicate events
 - huge tool outputs
 - repeated export
+- missing native conversation ID
+- URL/thread-ref identity fallback
+- deterministic derived conversation ID
+- duplicate titles with different timestamps
+- persistent fingerprint-to-UUID fallback
+- later discovery of native ID without changing canonical identity
 - remote pagination
 - network/auth failures
 - remote schema change
@@ -1035,6 +1101,11 @@ Required mechanisms:
 - [ ] ChatGPT scheduled activity appears in calendar/search
 - [ ] personal/work Claude and ChatGPT collectors can write to one personal-Drive-owned shared central sink
 - [ ] `claude-personal`, `claude-work`, `chatgpt-personal`, and `chatgpt-work` remain distinguishable
+- [ ] chat collection continues when provider-native conversation IDs are unavailable
+- [ ] every collector record has a stable `collector_conversation_id`
+- [ ] title-only identity generation is prohibited
+- [ ] fallback UUID identities persist fingerprint-to-UUID mappings across runs
+- [ ] discovering a native conversation ID later does not change the canonical session identity
 - [ ] cc-calendar treats collector sink data as read-only
 - [ ] attachment bodies are omitted by default while attachment metadata is retained
 - [ ] separate personal/work Drive sinks work as a fallback when Workspace external sharing is prohibited
