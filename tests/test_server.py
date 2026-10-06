@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from cc_calendar import __version__
 from cc_calendar.server import create_app
-from cc_calendar.store import ClaudeDir, CodexDir
+from cc_calendar.store import ClaudeDir, CodexDir, CollectorDir
 
 
 @pytest.fixture
@@ -158,6 +158,85 @@ def test_codex_log_uses_existing_transcript_shapes_and_deduplicates(codex_client
 
     assert [entry["kind"] for entry in log["entries"]] == ["user", "assistant"]
     assert [entry["text"] for entry in log["entries"]] == ["synthetic", "synthetic reply"]
+
+
+@pytest.fixture
+def collector_client(claude_dir, tmp_path):
+    collector_root = tmp_path / "collector"
+    collector_root.mkdir()
+    (collector_root / "activity.jsonl").write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in [
+                {
+                    "record_type": "session",
+                    "source_instance": "chatgpt-personal",
+                    "collector_conversation_id": "chatgpt-api-session",
+                    "provider": "openai",
+                    "product": "chatgpt",
+                    "title": "Synthetic Chat",
+                    "created_at": "2026-10-05T03:00:00Z",
+                    "last_activity_at": "2026-10-05T03:01:00Z",
+                },
+                {
+                    "record_type": "event",
+                    "source_instance": "chatgpt-personal",
+                    "collector_conversation_id": "chatgpt-api-session",
+                    "event_id": "chatgpt-user-1",
+                    "kind": "user_message",
+                    "role": "user",
+                    "timestamp": "2026-10-05T03:00:01Z",
+                    "text": "Synthetic collector prompt",
+                },
+                {
+                    "record_type": "event",
+                    "source_instance": "chatgpt-personal",
+                    "collector_conversation_id": "chatgpt-api-session",
+                    "event_id": "chatgpt-assistant-1",
+                    "kind": "assistant_message",
+                    "role": "assistant",
+                    "timestamp": "2026-10-05T03:00:02Z",
+                    "text": "Synthetic collector reply",
+                },
+            ]
+        )
+    )
+    with TestClient(
+        create_app(
+            claude_dir,
+            watch=False,
+            collector_dirs=[CollectorDir("chatgpt-personal", collector_root)],
+        ),
+        base_url="http://127.0.0.1",
+    ) as c:
+        yield c
+
+
+def test_collector_is_in_source_selector_and_session_list(collector_client):
+    data = collector_client.get("/api/sessions").json()
+    assert {source["name"] for source in data["sources"]} == {"local", "chatgpt-personal"}
+    sessions = [session for session in data["sessions"] if session["source"] == "chatgpt-personal"]
+    assert len(sessions) == 1
+    assert sessions[0]["title"] == "Synthetic Chat"
+    assert sessions[0]["project_name"] == "Misc"
+
+
+def test_collector_detail_canonical_and_log(collector_client):
+    data = collector_client.get("/api/sessions").json()
+    session_id = next(
+        session["id"] for session in data["sessions"] if session["source"] == "chatgpt-personal"
+    )
+    detail = collector_client.get(f"/api/sessions/{session_id}").json()
+    assert detail["title"] == "Synthetic Chat"
+    canonical = collector_client.get(f"/api/sessions/{session_id}/canonical").json()
+    assert canonical["session"]["collector_conversation_id"] == "chatgpt-api-session"
+    assert canonical["project"]["name"] == "Misc"
+    log = collector_client.get(f"/api/sessions/{session_id}/log").json()
+    assert [entry["kind"] for entry in log["entries"]] == ["user", "assistant"]
+    assert [entry["text"] for entry in log["entries"]] == [
+        "Synthetic collector prompt",
+        "Synthetic collector reply",
+    ]
 
 
 def test_log(client):

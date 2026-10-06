@@ -5,7 +5,7 @@ import shutil
 from conftest import PROJECT, LogBuilder
 
 from cc_calendar import store as store_mod
-from cc_calendar.store import ClaudeDir, CodexDir, Store
+from cc_calendar.store import ClaudeDir, CodexDir, CollectorDir, Store
 
 
 def test_scan(claude_dir):
@@ -106,6 +106,101 @@ def test_codex_partial_jsonl_and_repeated_scan_are_safe(claude_dir, tmp_path):
     store.scan()
     assert len(store.codex_sessions) == 1
     assert len(next(iter(store.codex_sessions.values())).events) == first_event_count
+
+
+def test_collector_source_scan_is_opt_in_and_replaced_on_rescan(claude_dir, tmp_path):
+    collector_root = tmp_path / "collector"
+    shard = collector_root / "activity.jsonl"
+    collector_root.mkdir()
+    shard.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in [
+                {
+                    "record_type": "session",
+                    "collector_conversation_id": "chatgpt-1",
+                    "provider": "openai",
+                    "product": "chatgpt",
+                    "title": "Synthetic Chat",
+                    "created_at": "2026-10-05T02:00:00Z",
+                    "last_activity_at": "2026-10-05T02:01:00Z",
+                },
+                {
+                    "record_type": "event",
+                    "collector_conversation_id": "chatgpt-1",
+                    "event_id": "m1",
+                    "kind": "user_message",
+                    "timestamp": "2026-10-05T02:00:01Z",
+                    "text": "Synthetic prompt",
+                },
+            ]
+        )
+    )
+    store = Store(
+        claude_dir,
+        collector_dirs=[CollectorDir("chatgpt-personal", collector_root)],
+    )
+    store.scan()
+
+    assert len(store.collector_sessions) == 1
+    imported = next(iter(store.collector_sessions.values()))
+    assert imported.session.source_instance == "chatgpt-personal"
+    assert imported.project.name == "Misc"
+    assert {source["name"] for source in store.source_catalog()} == {
+        "local",
+        "chatgpt-personal",
+    }
+    first_event_count = len(imported.events)
+    store.scan()
+    assert len(store.collector_sessions) == 1
+    assert len(next(iter(store.collector_sessions.values())).events) == first_event_count
+
+
+def test_collector_directory_reads_state_and_ignores_corrected_tmp(claude_dir, tmp_path):
+    collector_root = tmp_path / "collector"
+    collector_root.mkdir()
+    record = {
+        "schema_version": 1,
+        "source_instance": "claude-personal",
+        "provider": "anthropic",
+        "product": "claude-chat",
+        "conversation_id": "claude-native-1",
+        "title": "Synthetic Claude summary",
+        "summary": "Synthetic summary",
+        "last_activity_at": "2026-10-05T02:01:00Z",
+        "collector": {"history_completeness": "summary"},
+        "completed": True,
+    }
+    (collector_root / "01.jsonl").write_text(json.dumps(record) + "\n")
+    (collector_root / "05.corrected.tmp.jsonl").write_text(
+        json.dumps({**record, "conversation_id": "must-not-import"}) + "\n"
+    )
+    (collector_root / "_collector_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_instance": "claude-personal",
+                "backfill_complete": False,
+            }
+        )
+    )
+    store = Store(
+        claude_dir,
+        collector_dirs=[CollectorDir("claude-personal", collector_root)],
+    )
+    store.scan()
+
+    assert len(store.collector_sessions) == 1
+    imported = next(
+        value
+        for value in store.collector_sessions.values()
+        if value.session.native_id == "claude-native-1"
+    )
+    assert imported.session.backfill_complete is False
+    assert imported.events[0].kind == "summary"
+    assert all(
+        value.session.native_id != "must-not-import" for value in store.collector_sessions.values()
+    )
 
 
 def test_incremental_reads(claude_dir):

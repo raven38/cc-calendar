@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from cc_calendar.cli import claude_dirs, codex_dirs
+from cc_calendar.cli import claude_dirs, codex_dirs, collector_dirs
 
 
 def test_default_dir_is_named_local(tmp_path, monkeypatch):
@@ -55,3 +55,16 @@ def test_codex_dirs_are_opt_in_and_named(tmp_path, monkeypatch):
     assert [(d.name, d.path) for d in codex_dirs(["~/.codex"])] == [
         ("codex-local", codex.resolve())
     ]
+
+
+def test_collector_dirs_require_explicit_source_and_are_named(tmp_path, capsys):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    dirs = collector_dirs(
+        [str(first), f"chatgpt-work={second}", str(tmp_path / "missing"), str(first)]
+    )
+    assert [d.name for d in dirs] == ["first", "chatgpt-work"]
+    assert dirs[1].path == second.resolve()
+    assert "missing" in capsys.readouterr().err

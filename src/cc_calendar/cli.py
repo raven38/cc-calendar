@@ -15,7 +15,7 @@ import uvicorn
 
 from . import __version__, notes, search
 from .server import create_app
-from .store import ClaudeDir, CodexDir
+from .store import ClaudeDir, CodexDir, CollectorDir
 
 HOST = "127.0.0.1"
 NAME_RE = re.compile(r"[\w.-]+")
@@ -94,6 +94,30 @@ def codex_dirs(specs: list[str]) -> list[CodexDir]:
     return out
 
 
+def collector_dirs(specs: list[str]) -> list[CollectorDir]:
+    """Parse explicitly selected local collector directories; never infer a source."""
+    out: list[CollectorDir] = []
+    for spec in specs:
+        name, sep, rest = spec.partition("=")
+        if not (sep and NAME_RE.fullmatch(name)):
+            name, rest = "", spec
+        path = Path(rest).expanduser().resolve()
+        if not path.is_dir():
+            print(f"cc-calendar: warning: skipping {rest}: not a directory", file=sys.stderr)
+            continue
+        if any(source.path == path for source in out):
+            print(f"cc-calendar: warning: skipping {rest}: given twice", file=sys.stderr)
+            continue
+        if not name:
+            name = path.name or "collector"
+        taken = {source.name for source in out}
+        unique, n = name, 2
+        while unique in taken:
+            unique, n = f"{name}-{n}", n + 1
+        out.append(CollectorDir(unique, path))
+    return out
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="cc-calendar", description="Weekly calendar view of your Claude Code sessions."
@@ -115,6 +139,13 @@ def main(argv: list[str] | None = None) -> None:
         "(opt-in; no Codex history is read by default)",
     )
     parser.add_argument(
+        "--collector-dir",
+        action="append",
+        metavar="[SOURCE=]PATH",
+        help="local collector JSONL directory to read; repeat for several explicit sources; "
+        "read-only",
+    )
+    parser.add_argument(
         "--notes",
         metavar="PATH",
         type=Path,
@@ -134,12 +165,23 @@ def main(argv: list[str] | None = None) -> None:
     url = f"http://{HOST}:{port}/"
     dirs = claude_dirs(args.claude_dir or [str(Path.home() / ".claude")])
     codex = codex_dirs(args.codex_dir or [])
+    collector = collector_dirs(args.collector_dir or [])
     notes_path = (args.notes or notes.default_path()).expanduser()
     index_path = (args.search_index or search.default_path()).expanduser()
-    app = create_app(dirs, notes_path=notes_path, index_path=index_path, codex_dirs=codex)
+    app = create_app(
+        dirs,
+        notes_path=notes_path,
+        index_path=index_path,
+        codex_dirs=codex,
+        collector_dirs=collector,
+    )
     reading = (
         ", ".join(
-            [*(f"{d.name} ({d.path})" for d in dirs), *(f"{d.name} ({d.path})" for d in codex)]
+            [
+                *(f"{d.name} ({d.path})" for d in dirs),
+                *(f"{d.name} ({d.path})" for d in codex),
+                *(f"{d.name} ({d.path})" for d in collector),
+            ]
         )
         or "nothing"
     )

@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .canonical.chat_activity import ChatActivityAdapter
 from .canonical.claude_code import CanonicalImport, ClaudeCodeAdapter
 from .canonical.codex_local import CodexLocalAdapter
 from .parser import SessionAcc
@@ -57,21 +58,32 @@ class CodexDir:
         return self.path / "archived_sessions"
 
 
+@dataclass(frozen=True)
+class CollectorDir:
+    """A local collector shard directory and its explicit source instance."""
+
+    name: str
+    path: Path
+
+
 class Store:
     def __init__(
         self,
         dirs: Path | list[ClaudeDir],
         index: SearchIndex | None = None,
         codex_dirs: list[CodexDir] | None = None,
+        collector_dirs: list[CollectorDir] | None = None,
     ):
         self.dirs = [ClaudeDir("local", dirs)] if isinstance(dirs, Path) else list(dirs)
         self.codex_dirs = list(codex_dirs or [])
+        self.collector_dirs = list(collector_dirs or [])
         self.index = index  # full-text index, told about every transcript that changes
         # The same session can be in several directories (e.g. synced copies): every copy
         # is indexed, and `sessions` holds the one with the newest activity.
         self.copies: dict[str, dict[str, SessionAcc]] = {}  # sid -> dir name -> session
         self.sessions: dict[str, SessionAcc] = {}
         self.codex_sessions: dict[str, CanonicalImport] = {}
+        self.collector_sessions: dict[str, CanonicalImport] = {}
         self.files: dict[Path, FileState] = {}
         self.lock = threading.RLock()
 
@@ -91,6 +103,7 @@ class Store:
                 for path in sorted(projects.glob("*/*/subagents/*.jsonl")):
                     self.update_file(path)
             self._scan_codex()
+            self._scan_collectors()
             if self.index is not None:
                 # Forget transcripts Claude Code has deleted since the last run.
                 keep = {str(p) for p in self.files}
@@ -118,11 +131,28 @@ class Store:
                     ):
                         self.codex_sessions[imported.session.id] = imported
 
+    def _scan_collectors(self) -> None:
+        """Read explicitly selected collector JSONL shards without writing them."""
+        scanned: dict[str, CanonicalImport] = {}
+        for source in self.collector_dirs:
+            if not source.path.is_dir():
+                continue
+            adapter = ChatActivityAdapter(source_instance=source.name)
+            try:
+                scanned.update(adapter.import_directory(source.path))
+            except (OSError, ValueError) as exc:
+                log.warning("could not read collector shards at %s: %s", source.path, exc)
+        self.collector_sessions = scanned
+
     def source_catalog(self) -> list[dict[str, str]]:
         """Return the local sources selected for this store, for UI selectors."""
         return [
             *({"name": d.name, "path": str(d.path), "kind": "claude-code"} for d in self.dirs),
             *({"name": d.name, "path": str(d.path), "kind": "codex"} for d in self.codex_dirs),
+            *(
+                {"name": d.name, "path": str(d.path), "kind": "collector"}
+                for d in self.collector_dirs
+            ),
         ]
 
     def classify(self, path: Path) -> tuple[ClaudeDir, str, str, str | None] | None:
@@ -231,6 +261,10 @@ class Store:
         requested, so canonicalization cannot mutate or replace the existing index.
         """
         with self.lock:
+            if sid in self.codex_sessions:
+                return self.codex_sessions[sid]
+            if sid in self.collector_sessions:
+                return self.collector_sessions[sid]
             session = self.sessions.get(sid)
             if session is None:
                 return None

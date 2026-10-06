@@ -97,6 +97,13 @@ class Session:
     capabilities: SessionCapabilities = field(default_factory=SessionCapabilities)
     visibility: SessionVisibility = SessionVisibility.UNKNOWN
     external_project_ref: Any | None = None
+    collector_conversation_id: str | None = None
+    collector_id_method: str | None = None
+    identity_metadata: dict[str, Any] = field(default_factory=dict)
+    sync_state: str = "unknown"
+    backfill_status: str = "unknown"
+    backfill_complete: bool | None = None
+    completed: bool | None = None
 
 
 @dataclass

@@ -25,7 +25,7 @@ from .notes import NOTE_LIMIT, TAGS_PER_SESSION, Notes, NotesUnavailable
 from .parser import SessionAcc
 from .search import MIN_QUERY, SearchIndex, snippet
 from .stats import log_stats
-from .store import ClaudeDir, CodexDir, Store
+from .store import ClaudeDir, CodexDir, CollectorDir, Store
 from .tools import tool_usage
 
 log = logging.getLogger(__name__)
@@ -349,10 +349,16 @@ def create_app(
     notes_path: Path | None = None,
     index_path: Path | None = None,
     codex_dirs: list[CodexDir] | None = None,
+    collector_dirs: list[CollectorDir] | None = None,
 ) -> FastAPI:
     """`notes_path=None` and `index_path=None` keep notes and the search index in memory only
     (used by tests)."""
-    store = Store(dirs, open_index(index_path), codex_dirs=codex_dirs)
+    store = Store(
+        dirs,
+        open_index(index_path),
+        codex_dirs=codex_dirs,
+        collector_dirs=collector_dirs,
+    )
     notes = Notes(notes_path)
     broadcaster = Broadcaster()
     sessions_dirs = {d.sessions_dir for d in store.dirs}
@@ -422,6 +428,11 @@ def create_app(
                 for imported in store.codex_sessions.values()
                 if imported.session.start is not None
             )
+            items.extend(
+                canonical_summary(imported, gap * 60_000, notes)
+                for imported in store.collector_sessions.values()
+                if imported.session.start is not None
+            )
         return {
             "sessions": items,
             "claude_dirs": [{"name": d.name, "path": str(d.path)} for d in store.dirs],
@@ -471,8 +482,9 @@ def create_app(
         live = store.live_sessions()
         notes.refresh()
         with store.lock:
-            if sid in store.codex_sessions:
-                return canonical_detail(store.codex_sessions[sid], gap * 60_000, notes)
+            imported = store.codex_sessions.get(sid) or store.collector_sessions.get(sid)
+            if imported is not None:
+                return canonical_detail(imported, gap * 60_000, notes)
             s = get_session(sid)
             out = detail(s, live.get(sid), gap * 60_000, store.continued_from().get(sid), notes)
         out["also_in"] = store.also_in(sid)
@@ -530,8 +542,8 @@ def create_app(
         limit: int = Query(300, ge=1, le=2000),
         q: str | None = Query(None, max_length=QUERY_LIMIT),
     ) -> dict:
-        if sid in store.codex_sessions:
-            imported = store.codex_sessions[sid]
+        imported = store.codex_sessions.get(sid) or store.collector_sessions.get(sid)
+        if imported is not None:
             entries = [canonical_log_entry(event, i) for i, event in enumerate(imported.events)]
             return {
                 "total": len(entries),
